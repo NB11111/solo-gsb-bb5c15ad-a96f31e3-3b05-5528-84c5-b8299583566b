@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
-from app.policy import parse_network
+from app.policy import parse_address, parse_network
 
 
 class PolicyRequest(BaseModel):
@@ -24,6 +26,20 @@ class PolicyRequest(BaseModel):
         # response carrying the offending field and value.
         for value in values:
             parse_network(value)
+        return values
+
+
+class EvaluateRequest(PolicyRequest):
+    addresses: list[str] = Field(
+        default_factory=list,
+        description="Bare IPv4/IPv6 addresses to evaluate, in response order.",
+    )
+
+    @field_validator("addresses")
+    @classmethod
+    def _validate_address_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_address(value)
         return values
 
 
@@ -55,3 +71,18 @@ class NormalizeResponse(BaseModel):
         description="allow - deny for IPv6, minimal, non-overlapping, sorted.",
     )
     stats: Stats
+
+
+class AddressDecision(BaseModel):
+    decision: Literal["allow", "deny", "unmatched"] = Field(
+        description=(
+            "Winner side after longest-prefix matching; 'unmatched' when no "
+            "list entry contains the address."
+        ),
+    )
+    matched_cidr: str | None = Field(
+        description="Canonical CIDR of the winning entry; null when unmatched.",
+    )
+    matched_side: Literal["allow", "deny"] | None = Field(
+        description="List the winning entry came from; null when unmatched.",
+    )

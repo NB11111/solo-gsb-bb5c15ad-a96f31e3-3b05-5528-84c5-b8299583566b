@@ -7,7 +7,13 @@ import random
 
 import pytest
 
-from app.policy import _normalize_family, normalize, parse_network
+from app.policy import (
+    _normalize_family,
+    evaluate,
+    normalize,
+    parse_address,
+    parse_network,
+)
 
 
 def ref_subtract(allow, deny):
@@ -194,3 +200,138 @@ def test_matches_ipaddress_reference_ipv6(seed):
     expected = ref_subtract(allow, deny)
     actual = set(_normalize_family(allow, deny, ipaddress.IPv6Network))
     assert actual == expected
+
+
+# --------------------------------------------------------------------------
+# evaluate: longest-prefix matching
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_longest_prefix_wins():
+    # The more specific allow /25 must beat the broader allow /24.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        [],
+        ["10.0.0.1", "10.0.0.200"],
+    )
+    assert result == [
+        {"decision": "allow", "matched_cidr": "10.0.0.0/25",
+         "matched_side": "allow"},
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_deny_beats_allow_at_equal_length():
+    result = evaluate(
+        ["10.0.0.0/24"],
+        ["10.0.0.0/25"],
+        ["10.0.0.1", "10.0.0.200"],
+    )
+    assert result[0] == {
+        "decision": "deny", "matched_cidr": "10.0.0.0/25",
+        "matched_side": "deny",
+    }
+    # Only the broader allow covers the upper half.
+    assert result[1] == {
+        "decision": "allow", "matched_cidr": "10.0.0.0/24",
+        "matched_side": "allow",
+    }
+
+
+def test_evaluate_longer_prefix_always_wins_over_side():
+    # Even though the /16 is deny, the longer allow /24 must win inside it.
+    result = evaluate(
+        ["10.0.0.0/24"],
+        ["10.0.0.0/16"],
+        ["10.0.0.1"],
+    )
+    assert result == [
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_stable_tie_break_keeps_first_list_entry():
+    # Two identical allow entries: the earlier index wins; its canonical
+    # representation is reported, which is the same string either way, so
+    # also verify with two distinct equal-length matches is impossible
+    # (a host belongs to only one network of a given prefix length); instead
+    # assert the earlier duplicate does not produce a surprising result.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/24"],
+        ["10.0.0.0/24"],
+        ["10.0.0.1"],
+    )
+    assert result[0]["decision"] == "deny"
+    assert result[0]["matched_cidr"] == "10.0.0.0/24"
+
+    # Equal-length allow/allow duplicates remain stable allow decisions.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/24"], [], ["10.0.0.1"],
+    )
+    assert result[0] == {
+        "decision": "allow", "matched_cidr": "10.0.0.0/24",
+        "matched_side": "allow",
+    }
+
+
+def test_evaluate_unmatched_is_null():
+    result = evaluate(["10.0.0.0/8"], ["10.1.0.0/16"], ["192.0.2.1"])
+    assert result == [
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+    ]
+
+
+def test_evaluate_order_is_preserved():
+    addresses = ["10.0.0.2", "10.0.0.1", "10.1.0.1", "192.0.2.1"]
+    result = evaluate(["10.0.0.0/24"], ["10.1.0.0/16"], addresses)
+    assert [item["decision"] for item in result] == [
+        "allow", "allow", "deny", "unmatched",
+    ]
+    assert [item["matched_cidr"] for item in result] == [
+        "10.0.0.0/24", "10.0.0.0/24", "10.1.0.0/16", None,
+    ]
+
+
+def test_evaluate_mixed_families_are_independent():
+    result = evaluate(
+        ["10.0.0.0/8", "2001:db8::/32"],
+        ["10.1.0.0/16", "2001:db8:1::/48"],
+        ["10.1.0.1", "2001:db8:1::1", "2001:db8::1"],
+    )
+    assert result == [
+        {"decision": "deny", "matched_cidr": "10.1.0.0/16",
+         "matched_side": "deny"},
+        {"decision": "deny", "matched_cidr": "2001:db8:1::/48",
+         "matched_side": "deny"},
+        {"decision": "allow", "matched_cidr": "2001:db8::/32",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_empty_inputs():
+    assert evaluate([], [], ["10.0.0.1"]) == [
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+    ]
+    assert evaluate([], [], []) == []
+
+
+def test_evaluate_bare_host_prefix_cidr_entries_match():
+    # A bare CIDR-list entry is a host prefix and matches that one address.
+    result = evaluate(["10.0.0.1"], [], ["10.0.0.1", "10.0.0.2"])
+    assert result[0] == {
+        "decision": "allow", "matched_cidr": "10.0.0.1/32",
+        "matched_side": "allow",
+    }
+    assert result[1]["decision"] == "unmatched"
+
+
+def test_parse_address_rejects_cidr_and_garbage():
+    assert parse_address("10.0.0.1") == ipaddress.IPv4Address("10.0.0.1")
+    assert parse_address(" 2001:db8::1 ") == ipaddress.IPv6Address("2001:db8::1")
+    for bad in ["10.0.0.1/24", "10.0.0.1/32", "bogus", "999.0.0.1", ""]:
+        with pytest.raises(ValueError):
+            parse_address(bad)
+    with pytest.raises(ValueError):
+        parse_address(10)

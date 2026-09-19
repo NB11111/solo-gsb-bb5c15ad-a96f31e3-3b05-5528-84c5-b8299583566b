@@ -104,6 +104,60 @@ curl -i -X POST http://localhost:8000/normalize \
 #   "msg":"Value error, 10.0.0.1/24 has host bits set", ...}]}
 ```
 
+### `POST /evaluate`
+
+接收与 `/normalize` 相同的 `allow` / `deny` CIDR 列表，外加一个 `addresses`
+裸地址列表，对每个地址做**最长前缀匹配**，并按 `addresses` 的原顺序逐条返回
+判定结果。
+
+请求体：
+
+| 字段        | 类型       | 说明                                   |
+| ----------- | ---------- | -------------------------------------- |
+| `allow`     | `string[]` | 允许列表，IPv4/IPv6 可混填，可省略（默认 `[]`） |
+| `deny`      | `string[]` | 拒绝列表，规则同上                     |
+| `addresses` | `string[]` | 待判定的**裸 IP 地址**（不接受 CIDR 记法），顺序即返回顺序 |
+
+匹配优先级（逐级决胜）：
+
+1. **前缀长度最长者胜**；
+2. 前缀长度相同 → **deny 胜过 allow**；
+3. 仍相同（同一列表内的重复项）→ 按该列表中的**原顺序**取第一条；
+4. 没有任何条目包含该地址 → `unmatched`。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "allow": ["10.0.0.0/24", "10.0.0.0/25", "2001:db8::/32"],
+        "deny":  ["10.0.0.0/25"],
+        "addresses": ["10.0.0.1", "10.0.0.200", "192.0.2.1", "2001:db8::1"]
+      }'
+```
+
+响应（与 `addresses` 等长、同序）：
+
+```json
+[
+  {"decision": "deny",      "matched_cidr": "10.0.0.0/25", "matched_side": "deny"},
+  {"decision": "allow",     "matched_cidr": "10.0.0.0/24", "matched_side": "allow"},
+  {"decision": "unmatched", "matched_cidr": null,           "matched_side": null},
+  {"decision": "allow",     "matched_cidr": "2001:db8::/32", "matched_side": "allow"}
+]
+```
+
+字段说明：
+
+- `decision`：`allow` / `deny` / `unmatched`；
+- `matched_cidr`：获胜条目的规范 CIDR（裸地址条目规范化为主机前缀
+  `10.0.0.1/32`），未匹配时为 `null`；
+- `matched_side`：获胜条目来自 `allow` 还是 `deny`，未匹配时为 `null`。
+
+非法 CIDR 或非法地址（包括给 `addresses` 传入 `10.0.0.1/24` 这样的 CIDR
+记法）统一返回 **HTTP 422**。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -142,8 +196,8 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计（仅 ipaddress）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、POST /evaluate
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配（仅 ipaddress）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
 │   ├── test_policy.py # 核心算法单测 + 随机对拍（111 例）

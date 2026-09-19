@@ -15,6 +15,11 @@ from collections.abc import Iterable, Sequence
 from typing import TypeAlias, Union
 
 Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+Address: TypeAlias = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+# Side rank used as the second component of the match-comparison key: at equal
+# prefix length a deny entry must beat an allow entry.
+_SIDE_RANK: dict[str, int] = {"allow": 0, "deny": 1}
 
 _MAX_PREFIXLEN: dict[type, int] = {
     ipaddress.IPv4Network: 32,
@@ -32,6 +37,21 @@ def parse_network(value: object) -> Network:
     if not isinstance(value, str):
         raise ValueError(f"CIDR must be a string, got {type(value).__name__}")
     return ipaddress.ip_network(value.strip(), strict=True)
+
+
+def parse_address(value: object) -> Address:
+    """Parse a bare IPv4/IPv6 address (CIDR notation is rejected).
+
+    Unlike :func:`parse_network`, neither ``10.0.0.1/24`` nor a host prefix
+    such as ``10.0.0.1/32`` is accepted here — evaluation targets are plain
+    addresses only.  Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"address must be a string, got {type(value).__name__}")
+    text = value.strip()
+    if "/" in text:
+        raise ValueError(f"{value!r} is an address with a prefix length")
+    return ipaddress.ip_address(text)
 
 
 def _sort_key(network: Network) -> tuple[bytes, int]:
@@ -158,3 +178,74 @@ def normalize(allow_raw: Sequence[str], deny_raw: Sequence[str]) -> dict:
             },
         },
     }
+
+
+def _best_match(
+    address: Address,
+    entries: Sequence[tuple[int, Network, str]],
+) -> dict | None:
+    """Return the winning list entry for one address, or ``None`` if none match.
+
+    ``entries`` holds ``(original_index, network, side)`` triples restricted to
+    the address family.  The comparison key orders by:
+
+    1. prefix length — longest-prefix wins;
+    2. side rank — at equal length ``deny`` beats ``allow``;
+    3. original list index (negated) — the earlier entry in its side list
+       wins, which makes the final decision stable.
+    """
+    best: tuple[int, int, int] | None = None
+    best_network: Network | None = None
+    best_side: str | None = None
+    for index, network, side in entries:
+        if address in network:
+            key = (network.prefixlen, _SIDE_RANK[side], -index)
+            if best is None or key > best:
+                best = key
+                best_network = network
+                best_side = side
+    if best is None:
+        return None
+    return {
+        "decision": best_side,
+        "matched_cidr": str(best_network),
+        "matched_side": best_side,
+    }
+
+
+def evaluate(
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+    address_raw: Sequence[str],
+) -> list[dict]:
+    """Evaluate each address against allow/deny lists by longest-prefix match.
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema); a
+    malformed value raises :class:`ValueError`.  Results are returned in the
+    same order as ``address_raw``.
+    """
+    allow_entries: list[tuple[int, Network, str]] = [
+        (i, parse_network(item), "allow") for i, item in enumerate(allow_raw)
+    ]
+    deny_entries: list[tuple[int, Network, str]] = [
+        (i, parse_network(item), "deny") for i, item in enumerate(deny_raw)
+    ]
+    entries = allow_entries + deny_entries
+
+    results: list[dict] = []
+    for item in address_raw:
+        address = parse_address(item)
+        family_entries = [
+            (index, network, side)
+            for index, network, side in entries
+            if network.version == address.version
+        ]
+        match = _best_match(address, family_entries)
+        if match is None:
+            results.append(
+                {"decision": "unmatched", "matched_cidr": None,
+                 "matched_side": None}
+            )
+        else:
+            results.append(match)
+    return results
