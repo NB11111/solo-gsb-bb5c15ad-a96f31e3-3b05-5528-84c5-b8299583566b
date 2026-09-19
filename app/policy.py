@@ -15,6 +15,7 @@ from collections.abc import Iterable, Sequence
 from typing import TypeAlias, Union
 
 Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+Address: TypeAlias = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 _MAX_PREFIXLEN: dict[type, int] = {
     ipaddress.IPv4Network: 32,
@@ -32,6 +33,17 @@ def parse_network(value: object) -> Network:
     if not isinstance(value, str):
         raise ValueError(f"CIDR must be a string, got {type(value).__name__}")
     return ipaddress.ip_network(value.strip(), strict=True)
+
+
+def parse_address(value: object) -> Address:
+    """Parse a bare IP address string into an IPv4/IPv6 address object.
+
+    Unlike :func:`parse_network` no prefix is accepted (``10.0.0.1/32`` is
+    rejected).  Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Address must be a string, got {type(value).__name__}")
+    return ipaddress.ip_address(value.strip())
 
 
 def _sort_key(network: Network) -> tuple[bytes, int]:
@@ -158,3 +170,61 @@ def normalize(allow_raw: Sequence[str], deny_raw: Sequence[str]) -> dict:
             },
         },
     }
+
+
+def evaluate(
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+    addresses_raw: Sequence[str],
+) -> dict:
+    """Longest-prefix-match each address against the allow/deny lists.
+
+    For every address the matching entry with the longest prefix wins; on
+    equal prefix length deny beats allow, and any remaining tie is resolved
+    stably by each list's original order (earlier entries win).  An address
+    contained in no entry is ``unmatched``.  Results follow the input order
+    of ``addresses_raw``.  Input strings are assumed to have been validated
+    already (e.g. by the Pydantic schema); a malformed value raises
+    :class:`ValueError`.
+    """
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+    addresses = [parse_address(item) for item in addresses_raw]
+
+    # Side priority for equal prefix lengths: deny (0) beats allow (1).
+    sides: tuple[tuple[str, list[Network]], ...] = (
+        ("deny", deny_nets),
+        ("allow", allow_nets),
+    )
+
+    results: list[dict] = []
+    for address in addresses:
+        best_key: tuple[int, int, int] | None = None
+        best_cidr: str | None = None
+        best_side: str | None = None
+        for side_priority, (side, networks) in enumerate(sides):
+            for index, network in enumerate(networks):
+                # ``in`` is False across address families, so IPv4 addresses
+                # can never match IPv6 entries and vice versa.
+                if address not in network:
+                    continue
+                # Smaller key wins: longer prefix first, then deny over
+                # allow, then earlier position in the original list.
+                key = (-network.prefixlen, side_priority, index)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_cidr = str(network)
+                    best_side = side
+        if best_key is None:
+            results.append({
+                "decision": "unmatched",
+                "matched_cidr": None,
+                "matched_side": None,
+            })
+        else:
+            results.append({
+                "decision": best_side,
+                "matched_cidr": best_cidr,
+                "matched_side": best_side,
+            })
+    return {"results": results}

@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from app.policy import _normalize_family, normalize, parse_network
+from app.policy import _normalize_family, evaluate, normalize, parse_address, parse_network
 
 
 def ref_subtract(allow, deny):
@@ -133,6 +133,50 @@ def test_garbage_rejected():
 def test_host_prefix_subtraction():
     result = normalize(["10.0.0.0/30"], ["10.0.0.1/32", "10.0.0.2/32"])
     assert result["ipv4"] == ["10.0.0.0/32", "10.0.0.3/32"]
+
+
+def test_evaluate_longest_prefix_wins():
+    result = evaluate(["10.0.0.0/8"], ["10.0.0.0/16"], ["10.0.0.1"])
+    assert result["results"] == [
+        {"decision": "deny", "matched_cidr": "10.0.0.0/16",
+         "matched_side": "deny"},
+    ]
+
+
+def test_evaluate_deny_wins_equal_prefixlen():
+    result = evaluate(["10.0.0.0/24"], ["10.0.0.0/24"], ["10.0.0.9"])
+    assert result["results"][0] == {
+        "decision": "deny", "matched_cidr": "10.0.0.0/24",
+        "matched_side": "deny",
+    }
+
+
+def test_evaluate_unmatched_when_nothing_contains_address():
+    result = evaluate(["10.0.0.0/24"], [], ["192.0.2.1", "::1"])
+    assert result["results"] == [
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+    ]
+
+
+def test_evaluate_families_are_isolated():
+    # An IPv4 address never matches an IPv6 entry and vice versa.
+    result = evaluate(["::/0"], ["0.0.0.0/0"], ["10.0.0.1", "::1"])
+    assert result["results"] == [
+        {"decision": "deny", "matched_cidr": "0.0.0.0/0",
+         "matched_side": "deny"},
+        {"decision": "allow", "matched_cidr": "::/0",
+         "matched_side": "allow"},
+    ]
+
+
+def test_parse_address_rejects_prefix_and_garbage():
+    assert parse_address("10.0.0.1") == ipaddress.IPv4Address("10.0.0.1")
+    for bad in ["10.0.0.1/32", "not-an-ip", "", "999.0.0.1"]:
+        with pytest.raises(ValueError):
+            parse_address(bad)
+    with pytest.raises(ValueError):
+        parse_address(10)
 
 
 def test_output_is_non_overlapping_and_minimal():

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from typing import Literal
 
-from app.policy import parse_network
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.policy import parse_address, parse_network
 
 
 class PolicyRequest(BaseModel):
@@ -55,3 +57,101 @@ class NormalizeResponse(BaseModel):
         description="allow - deny for IPv6, minimal, non-overlapping, sorted.",
     )
     stats: Stats
+
+
+class EvaluateRequest(PolicyRequest):
+    """Allow/deny lists (same rules as /normalize) plus addresses to evaluate."""
+
+    addresses: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bare IP addresses to evaluate (IPv4/IPv6 may be mixed); "
+            "results are returned in this order."
+        ),
+        examples=[["10.1.0.1", "2001:db8::1"]],
+    )
+
+    @field_validator("addresses")
+    @classmethod
+    def _validate_address_list(cls, values: list[str]) -> list[str]:
+        # Same 422 behaviour as the CIDR lists: ValueError -> HTTP 422.
+        for value in values:
+            parse_address(value)
+        return values
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "allow": ["10.0.0.0/8", "10.1.0.0/16", "2001:db8::/32"],
+                    "deny": ["10.1.0.0/24", "10.0.0.0/8"],
+                    "addresses": [
+                        "10.1.0.1",
+                        "10.1.1.1",
+                        "10.2.0.1",
+                        "2001:db8::1",
+                        "192.0.2.1",
+                    ],
+                }
+            ]
+        }
+    )
+
+
+class Evaluation(BaseModel):
+    decision: Literal["allow", "deny", "unmatched"] = Field(
+        description="Outcome for the address.",
+        examples=["deny"],
+    )
+    matched_cidr: str | None = Field(
+        default=None,
+        description="The winning CIDR entry; null when unmatched.",
+        examples=["10.1.0.0/24"],
+    )
+    matched_side: Literal["allow", "deny"] | None = Field(
+        default=None,
+        description="Which list the winning entry came from; null when unmatched.",
+        examples=["deny"],
+    )
+
+
+class EvaluateResponse(BaseModel):
+    results: list[Evaluation] = Field(
+        description="One evaluation per input address, in input order.",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "results": [
+                        {
+                            "decision": "deny",
+                            "matched_cidr": "10.1.0.0/24",
+                            "matched_side": "deny",
+                        },
+                        {
+                            "decision": "allow",
+                            "matched_cidr": "10.1.0.0/16",
+                            "matched_side": "allow",
+                        },
+                        {
+                            "decision": "deny",
+                            "matched_cidr": "10.0.0.0/8",
+                            "matched_side": "deny",
+                        },
+                        {
+                            "decision": "allow",
+                            "matched_cidr": "2001:db8::/32",
+                            "matched_side": "allow",
+                        },
+                        {
+                            "decision": "unmatched",
+                            "matched_cidr": None,
+                            "matched_side": None,
+                        },
+                    ]
+                }
+            ]
+        }
+    )

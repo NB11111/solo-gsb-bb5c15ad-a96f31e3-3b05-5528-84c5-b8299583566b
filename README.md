@@ -12,6 +12,9 @@
 - 统计 allow / deny 的输入数量、去重后数量（按族拆分）与最终输出数量；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
+此外，`POST /evaluate` 按**最长前缀匹配**评估单个地址命中 allow / deny
+的结果（见下文）。
+
 ## 一条命令启动
 
 依赖在镜像构建时安装完成，容器启动即提供服务：
@@ -104,6 +107,71 @@ curl -i -X POST http://localhost:8000/normalize \
 #   "msg":"Value error, 10.0.0.1/24 has host bits set", ...}]}
 ```
 
+### `POST /evaluate`
+
+在 `allow` / `deny`（规则同 `/normalize`）之外增加 `addresses` 字段：
+
+| 字段        | 类型       | 说明                                             |
+| ----------- | ---------- | ------------------------------------------------ |
+| `allow`     | `string[]` | 允许列表，可省略（默认 `[]`）                    |
+| `deny`      | `string[]` | 拒绝列表，可省略（默认 `[]`）                    |
+| `addresses` | `string[]` | 待评估的裸 IP 地址（IPv4/IPv6 可混填），结果按此顺序返回 |
+
+匹配规则（最长前缀匹配）：
+
+1. 包含该地址的条目中，**前缀长度更长者胜出**；
+2. 前缀长度相同时 **deny 胜过 allow**；
+3. 仍并列时按各列表**原始顺序稳定决胜**（先出现者胜出）；
+4. 没有任何条目包含该地址时为 `unmatched`。
+
+IPv4 地址只匹配 IPv4 条目，IPv6 同理，两族互不影响。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "allow": ["10.0.0.0/8", "10.1.0.0/16", "2001:db8::/32"],
+        "deny":  ["10.1.0.0/24", "10.0.0.0/8"],
+        "addresses": ["10.1.0.1", "10.1.1.1", "10.2.0.1", "2001:db8::1", "192.0.2.1"]
+      }'
+```
+
+响应（与 `addresses` 一一对应、顺序一致）：
+
+```json
+{
+  "results": [
+    {"decision": "deny",      "matched_cidr": "10.1.0.0/24",   "matched_side": "deny"},
+    {"decision": "allow",     "matched_cidr": "10.1.0.0/16",   "matched_side": "allow"},
+    {"decision": "deny",      "matched_cidr": "10.0.0.0/8",    "matched_side": "deny"},
+    {"decision": "allow",     "matched_cidr": "2001:db8::/32", "matched_side": "allow"},
+    {"decision": "unmatched", "matched_cidr": null,            "matched_side": null}
+  ]
+}
+```
+
+字段说明：
+
+- `decision`：`allow` / `deny` / `unmatched`；
+- `matched_cidr`：胜出的 CIDR 条目（`unmatched` 时为 `null`）；
+- `matched_side`：胜出条目所在列表（`unmatched` 时为 `null`）。
+
+上例中：`10.1.0.1` 命中 deny `10.1.0.0/24`（/24 比 allow 的 /16、/8 更长）；
+`10.2.0.1` 在 allow 与 deny 中同长（/8），deny 胜出；`192.0.2.1` 无任何条目
+包含，为 `unmatched`。
+
+非法地址（如 `10.0.0.1/32` 带前缀、`bogus`）或非法 CIDR 同样返回 422：
+
+```bash
+curl -i -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"addresses": ["10.0.0.1/32"]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error","loc":["body","addresses"], ...}]}
+```
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -142,12 +210,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计（仅 ipaddress）
-│   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、POST /evaluate
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配（仅 ipaddress）
+│   └── schemas.py     # Pydantic 请求/响应模型、OpenAPI 示例与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（111 例）
-│   └── test_api.py    # API 层测试（422、统计、空请求等）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（116 例）
+│   └── test_api.py    # API 层测试（422、统计、空请求、/evaluate 匹配等）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
